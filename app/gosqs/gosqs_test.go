@@ -809,6 +809,10 @@ func TestRequeueing_ResetVisibilityTimeout(t *testing.T) {
 	if ok := strings.Contains(rr.Body.String(), "<Message>"); !ok {
 		t.Fatal("handler should return a message")
 	}
+	substr := "<Name>ApproximateReceiveCount</Name>\n                  <Value>2</Value>\n"
+	if ok := strings.Contains(rr.Body.String(), substr); !ok {
+		t.Fatal("handler should return ApproximateReceiveCount message attribute")
+	}
 	done <- struct{}{}
 }
 
