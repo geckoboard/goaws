@@ -10,7 +10,7 @@ import (
 	"time"
 
 	log "github.com/sirupsen/logrus"
-
+	
 	"github.com/gorilla/mux"
 	"github.com/p4tin/goaws/app"
 	"github.com/p4tin/goaws/app/common"
@@ -110,7 +110,7 @@ func CreateQueue(w http.ResponseWriter, req *http.Request) {
 	queueUrl := "http://" + app.CurrentEnvironment.Host + ":" + app.CurrentEnvironment.Port +
 		"/" + app.CurrentEnvironment.AccountID + "/" + queueName
 	if app.CurrentEnvironment.Region != "" {
-		queueUrl = "http://sqs." + app.CurrentEnvironment.Region + "." + app.CurrentEnvironment.Host + ":" +
+		queueUrl = "http://" + app.CurrentEnvironment.Region + "." + app.CurrentEnvironment.Host + ":" +
 			app.CurrentEnvironment.Port + "/" + app.CurrentEnvironment.AccountID + "/" + queueName
 	}
 	queueArn := "arn:aws:sqs:" + app.CurrentEnvironment.Region + ":" + app.CurrentEnvironment.AccountID + ":" + queueName
@@ -373,10 +373,23 @@ func ReceiveMessage(w http.ResponseWriter, req *http.Request) {
 	loops := waitTimeSeconds * 10
 	for loops > 0 {
 		app.SyncQueues.RLock()
-		found := len(app.SyncQueues.Queues[queueName].Messages)-numberOfHiddenMessagesInQueue(*app.SyncQueues.Queues[queueName]) != 0
+		_, queueFound := app.SyncQueues.Queues[queueName]
+		if !queueFound {
+			app.SyncQueues.RUnlock()
+			createErrorResponse(w, req, "QueueNotFound")
+			return
+		}
+		messageFound := len(app.SyncQueues.Queues[queueName].Messages)-numberOfHiddenMessagesInQueue(*app.SyncQueues.Queues[queueName]) != 0
 		app.SyncQueues.RUnlock()
-		if !found {
-			time.Sleep(100 * time.Millisecond)
+		if !messageFound {
+			continueTimer := time.NewTimer(100 * time.Millisecond)
+			select {
+			case <-req.Context().Done():
+				continueTimer.Stop()
+				return // client gave up
+			case <-continueTimer.C:
+				continueTimer.Stop()
+			}
 			loops--
 		} else {
 			break
@@ -597,7 +610,7 @@ func DeleteMessageBatch(w http.ResponseWriter, req *http.Request) {
 
 	notFoundEntries := make([]app.BatchResultErrorEntry, 0)
 	for _, deleteEntry := range deleteEntries {
-		if deleteEntry.Deleted == false {
+		if deleteEntry.Deleted {
 			notFoundEntries = append(notFoundEntries, app.BatchResultErrorEntry{
 				Code:        "1",
 				Id:          deleteEntry.Id,
@@ -690,7 +703,7 @@ func DeleteQueue(w http.ResponseWriter, req *http.Request) {
 	app.SyncQueues.Unlock()
 
 	// Create, encode/xml and send response
-	respStruct := app.DeleteMessageResponse{"http://queue.amazonaws.com/doc/2012-11-05/", app.ResponseMetadata{RequestId: "00000000-0000-0000-0000-000000000000"}}
+	respStruct := app.DeleteQueueResponse{"http://queue.amazonaws.com/doc/2012-11-05/", app.ResponseMetadata{RequestId: "00000000-0000-0000-0000-000000000000"}}
 	enc := xml.NewEncoder(w)
 	enc.Indent("  ", "    ")
 	if err := enc.Encode(respStruct); err != nil {
@@ -854,10 +867,10 @@ func getMessageResult(m *app.Message) *app.ResultMessage {
 	}
 
 	attrsMap := map[string]string{
-		"ApproximateFirstReceiveTimestamp": fmt.Sprintf("%d", m.ReceiptTime.Unix()),
+		"ApproximateFirstReceiveTimestamp": fmt.Sprintf("%d", m.ReceiptTime.UnixNano()/int64(time.Millisecond)),
 		"SenderId":                         app.CurrentEnvironment.AccountID,
 		"ApproximateReceiveCount":          fmt.Sprintf("%d", m.NumberOfReceives+1),
-		"SentTimestamp":                    fmt.Sprintf("%d", time.Now().UTC().Unix()),
+		"SentTimestamp":                    fmt.Sprintf("%d", time.Now().UTC().UnixNano()/int64(time.Millisecond)),
 	}
 
 	var attrs []*app.ResultAttribute
@@ -892,7 +905,10 @@ func getQueueFromPath(formVal string, theUrl string) string {
 
 func createErrorResponse(w http.ResponseWriter, req *http.Request, err string) {
 	er := app.SqsErrors[err]
-	respStruct := app.ErrorResponse{app.ErrorResult{Type: er.Type, Code: er.Code, Message: er.Message, RequestId: "00000000-0000-0000-0000-000000000000"}}
+	respStruct := app.ErrorResponse{
+		Result:    app.ErrorResult{Type: er.Type, Code: er.Code, Message: er.Message},
+		RequestId: "00000000-0000-0000-0000-000000000000",
+	}
 
 	w.WriteHeader(er.HttpError)
 	enc := xml.NewEncoder(w)

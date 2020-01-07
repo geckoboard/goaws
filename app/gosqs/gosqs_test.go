@@ -1,12 +1,14 @@
 package gosqs
 
 import (
+	"context"
 	"encoding/xml"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1035,6 +1037,199 @@ func TestReceiveMessageWaitTimeEnforced(t *testing.T) {
 		t.Fatal("handler waited when message was available, expected not to wait")
 	}
 }
+func TestReceiveMessage_CanceledByClient(t *testing.T) {
+	// create a queue
+	req, err := http.NewRequest("POST", "/", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	form := url.Values{}
+	form.Add("Action", "CreateQueue")
+	form.Add("QueueName", "cancel-queue")
+	form.Add("Attribute.1.Name", "ReceiveMessageWaitTimeSeconds")
+	form.Add("Attribute.1.Value", "20")
+	form.Add("Version", "2012-11-05")
+	req.PostForm = form
+
+	rr := httptest.NewRecorder()
+	http.HandlerFunc(CreateQueue).ServeHTTP(rr, req)
+
+	var wg sync.WaitGroup
+	ctx, cancelReceive := context.WithCancel(context.Background())
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		// receive message (that will be canceled)
+		req, err := http.NewRequest("POST", "/", nil)
+		req = req.WithContext(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		form := url.Values{}
+		form.Add("Action", "ReceiveMessage")
+		form.Add("QueueUrl", "http://localhost:4100/queue/cancel-queue")
+		form.Add("Version", "2012-11-05")
+		req.PostForm = form
+
+		rr := httptest.NewRecorder()
+		http.HandlerFunc(ReceiveMessage).ServeHTTP(rr, req)
+
+		if status := rr.Code; status != http.StatusOK {
+			t.Errorf("handler returned wrong status code: got \n%v want %v",
+				status, http.StatusOK)
+		}
+
+		if ok := strings.Contains(rr.Body.String(), "12345"); ok {
+			t.Fatal("expecting this ReceiveMessage() to not pickup this message as it should canceled before the Send()")
+		}
+	}()
+	time.Sleep(100 * time.Millisecond) // let enought time for the Receive go to wait mode
+	cancelReceive()                    // cancel the first ReceiveMessage(), make sure it will not pickup the sent message below
+	time.Sleep(5 * time.Millisecond)
+
+	// send a message
+	req, err = http.NewRequest("POST", "/", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	form = url.Values{}
+	form.Add("Action", "SendMessage")
+	form.Add("QueueUrl", "http://localhost:4100/queue/cancel-queue")
+	form.Add("MessageBody", "12345")
+	form.Add("Version", "2012-11-05")
+	req.PostForm = form
+
+	rr = httptest.NewRecorder()
+	http.HandlerFunc(SendMessage).ServeHTTP(rr, req)
+
+	if status := rr.Code; status != http.StatusOK {
+		t.Errorf("handler returned wrong status code: got \n%v want %v",
+			status, http.StatusOK)
+	}
+
+	// receive message
+	req, err = http.NewRequest("POST", "/", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	form = url.Values{}
+	form.Add("Action", "ReceiveMessage")
+	form.Add("QueueUrl", "http://localhost:4100/queue/cancel-queue")
+	form.Add("Version", "2012-11-05")
+	req.PostForm = form
+
+	rr = httptest.NewRecorder()
+
+	start := time.Now()
+	http.HandlerFunc(ReceiveMessage).ServeHTTP(rr, req)
+	elapsed := time.Since(start)
+
+	if status := rr.Code; status != http.StatusOK {
+		t.Errorf("handler returned wrong status code: got \n%v want %v",
+			status, http.StatusOK)
+	}
+	if ok := strings.Contains(rr.Body.String(), "12345"); !ok {
+		t.Fatal("handler should return a message")
+	}
+	if elapsed > 1*time.Second {
+		t.Fatal("handler waited when message was available, expected not to wait")
+	}
+
+	if timedout := waitTimeout(&wg, 2*time.Second); timedout {
+		t.Errorf("expected ReceiveMessage() in goroutine to exit quickly due to cancelReceive() called")
+	}
+}
+
+func TestReceiveMessage_WithConcurrentDeleteQueue(t *testing.T) {
+	// create a queue
+	req, err := http.NewRequest("POST", "/", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	form := url.Values{}
+	form.Add("Action", "CreateQueue")
+	form.Add("QueueName", "waiting-queue")
+	form.Add("Attribute.1.Name", "ReceiveMessageWaitTimeSeconds")
+	form.Add("Attribute.1.Value", "1")
+	form.Add("Version", "2012-11-05")
+	req.PostForm = form
+
+	rr := httptest.NewRecorder()
+	http.HandlerFunc(CreateQueue).ServeHTTP(rr, req)
+
+	if status := rr.Code; status != http.StatusOK {
+		t.Errorf("handler returned wrong status code: got \n%v want %v",
+			status, http.StatusOK)
+	}
+
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		// receive message
+		req, err := http.NewRequest("POST", "/", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		form := url.Values{}
+		form.Add("Action", "ReceiveMessage")
+		form.Add("QueueUrl", "http://localhost:4100/queue/waiting-queue")
+		form.Add("Version", "2012-11-05")
+		req.PostForm = form
+
+		rr := httptest.NewRecorder()
+
+		http.HandlerFunc(ReceiveMessage).ServeHTTP(rr, req)
+
+		// Check the status code is what we expect.
+		if status := rr.Code; status != http.StatusBadRequest {
+			t.Errorf("handler returned wrong status code: got %v want %v",
+				status, http.StatusBadRequest)
+		}
+
+		// Check the response body is what we expect.
+		expected := "QueueNotFound"
+		if !strings.Contains(rr.Body.String(), "Not Found") {
+			t.Errorf("handler returned unexpected body: got %v want %v",
+				rr.Body.String(), expected)
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		time.Sleep(10 * time.Millisecond) // 10ms to let the ReceiveMessage() block
+		// delete queue message
+		req, err := http.NewRequest("POST", "/", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		form := url.Values{}
+		form.Add("Action", "DeleteQueue")
+		form.Add("QueueUrl", "http://localhost:4100/queue/waiting-queue")
+		form.Add("Version", "2012-11-05")
+		req.PostForm = form
+
+		rr := httptest.NewRecorder()
+		http.HandlerFunc(DeleteQueue).ServeHTTP(rr, req)
+
+		if status := rr.Code; status != http.StatusOK {
+			t.Errorf("handler returned wrong status code: got \n%v want %v",
+				status, http.StatusOK)
+		}
+	}()
+
+	if timedout := waitTimeout(&wg, 2*time.Second); timedout {
+		t.Errorf("concurrent handlers timeout, expecting both to return within timeout")
+	}
+
+}
 
 func TestSetQueueAttributes_POST_QueueNotFound(t *testing.T) {
 	req, err := http.NewRequest("POST", "/", nil)
@@ -1265,4 +1460,21 @@ func TestSendingAndReceivingFromFIFOQueueReturnsSameMessageOnError(t *testing.T)
 	}
 
 	done <- struct{}{}
+}
+
+// waitTimeout waits for the waitgroup for the specified max timeout.
+// Returns true if waiting timed out.
+// credits: https://stackoverflow.com/questions/32840687/timeout-for-waitgroup-wait
+func waitTimeout(wg *sync.WaitGroup, timeout time.Duration) bool {
+	c := make(chan struct{})
+	go func() {
+		defer close(c)
+		wg.Wait()
+	}()
+	select {
+	case <-c:
+		return false // completed normally
+	case <-time.After(timeout):
+		return true // timed out
+	}
 }
