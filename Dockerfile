@@ -1,19 +1,14 @@
-#FROM golang:alpine as builder
-#
-#WORKDIR /go/src/github.com/p4tin/goaws
-#
-#RUN apk add --update --repository https://dl-3.alpinelinux.org/alpine/edge/testing/ git
-#RUN go get github.com/golang/dep/cmd/dep
-#
-#COPY Gopkg.lock Gopkg.toml app ./
-#RUN dep ensure
-#COPY . .
-#
-#RUN go build -o goaws_linux_amd64 app/cmd/goaws.goc
-FROM alpine
+FROM golang:1.15-alpine AS build-env
 
-EXPOSE 4100
+RUN apk add make bash git
 
-COPY goaws /
-COPY app/conf/goaws.yaml /conf/
-ENTRYPOINT ["/goaws"]
+WORKDIR /goaws 
+ADD . .
+
+RUN go build -o goaws app/cmd/goaws.go
+
+FROM alpine:3.7
+WORKDIR /app 
+
+COPY --from=build-env /goaws/goaws /app/
+CMD ["./goaws"]
