@@ -1,4 +1,4 @@
-FROM golang:1.13.2-alpine AS build-env
+FROM golang:1.15-alpine AS build-env
 
 RUN apk add make bash git
 
@@ -11,4 +11,4 @@ FROM alpine:3.7
 WORKDIR /app 
 
 COPY --from=build-env /goaws/goaws /app/
-ENTRYPOINT ["./goaws"]
+CMD ["./goaws"]
